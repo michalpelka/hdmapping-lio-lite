@@ -1,0 +1,72 @@
+name: dataset
+
+# Build mini_lio_run, run it on the underground parking Mandeye session from Hugging Face and upload the
+# HDMapping-style result folder plus a trajectory plot as artifacts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  HF_DATASET: MichalPelka/UndegroundParkingDataset
+
+jobs:
+  underground-parking:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libeigen3-dev liblaszip-dev python3-numpy python3-matplotlib
+          pipx install "huggingface_hub[cli]"
+
+      - name: Dataset revision
+        id: rev
+        run: echo "sha=$(curl -sf https://huggingface.co/api/datasets/$HF_DATASET | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache dataset
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: hf-${{ env.HF_DATASET }}-${{ steps.rev.outputs.sha }}
+
+      - name: Download dataset (mandeye session only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: hf download "$HF_DATASET" --repo-type dataset --revision "${{ steps.rev.outputs.sha }}" --include "mandeye/*" --local-dir data
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          test -x build/mini_lio_run
+
+      - name: Run mini_lio_run
+        run: |
+          set -o pipefail
+          ./build/mini_lio_run data/mandeye -o session 2>&1 | tee mini_lio_run.log
+          cp mini_lio_run.log session/
+
+      - name: Plot trajectory
+        run: |
+          python3 tools/plot_trajectory.py session=mini_lio -o trajectory.png --csv trajectory_world.csv \
+            --title "mini_lio on UndegroundParkingDataset (${GITHUB_SHA::7}, defaults = HDMapping step 1 settings)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trajectory
+          path: |
+            trajectory.png
+            trajectory_world.csv
+            mini_lio_run.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: session
+          path: session
+          compression-level: 0 # laz is already compressed
