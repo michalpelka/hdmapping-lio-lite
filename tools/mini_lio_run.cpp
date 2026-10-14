@@ -21,6 +21,7 @@ static void usage()
         "  --imu-id N        IMU id to use (default 0)\n"
         "  --use-first-file  also use points of the first laz (upstream drops them)\n"
         "  --vqf             VQF instead of Madgwick/Fusion\n"
+        "  --imu-rate HZ     IMU rate for the AHRS (default: from the csv timestamps)\n"
         "  --iters N         LM iterations per chunk (default 100 as upstream; 8-15 is much faster)\n"
         "  --window S        rolling map of the last ~S seconds instead of 200 m of travel\n"
         "  --max-seconds S   stop after S seconds of lidar data (after the first used file)\n"
@@ -37,7 +38,7 @@ int main(int argc, char** argv)
     std::string out_dir;
     int imu_id = 0, chunks_per_scan = 51;
     bool use_first = false, write_laz = true;
-    double max_seconds = 0.0, min_out = 0.5;
+    double max_seconds = 0.0, min_out = 0.5, imu_rate = 0.0;
     for (int i = 1; i < argc; ++i)
     {
         const auto arg = [&](const char* n) { return !std::strcmp(argv[i], n); };
@@ -50,6 +51,8 @@ int main(int argc, char** argv)
             use_first = true;
         else if (arg("--vqf"))
             P.use_vqf = true;
+        else if (arg("--imu-rate"))
+            imu_rate = std::atof(val());
         else if (arg("--iters"))
             P.nr_iter = std::atoi(val());
         else if (arg("--window"))
@@ -111,6 +114,15 @@ int main(int argc, char** argv)
     if (imu.size() < 100)
         return std::fprintf(stderr, "only %zu IMU samples for imu id %d\n", imu.size(), imu_id), 1;
     std::printf("session: %zu laz/csv pairs, %zu IMU samples (imu id %d), %.1f s\n", n_files, imu.size(), imu_id, imu.back().s.t - imu.front().s.t);
+
+    // VQF integrates with a fixed sample time: use the real rate (Livox 200 Hz, Hesai JT ~430 Hz).
+    // Average over the whole span: some IMUs (Hesai JT) timestamp samples in bursts, so the
+    // median interval is far shorter than the real sample period.
+    if (imu_rate <= 0.0 && imu.back().s.t > imu.front().s.t)
+        imu_rate = std::round((imu.size() - 1) / (imu.back().s.t - imu.front().s.t));
+    if (imu_rate > 0.0)
+        P.imu_rate_hz = imu_rate;
+    std::printf("IMU rate: %.0f Hz\n", P.imu_rate_hz);
 
     if (out_dir.empty())
     {

@@ -48,8 +48,13 @@ Build and demo: `cmake -S . -B build -G Ninja && cmake --build build && ./build/
 
 ```
 cmake -S . -B build -G Ninja && cmake --build build          # builds mini_lio_run if LASzip is found
-./build/mini_lio_run <session dir> [-o out_dir] --vqf --iters 10 [--window 3] [--max-seconds 20]
+./build/mini_lio_run <session dir> [-o out_dir] --vqf --iters 10 [--window 3] [--max-seconds 20] [--imu-rate HZ]
 ```
+
+IMU rate: VQF integrates with a fixed sample period (`Params::imu_rate_hz`, default 200 Hz), so `mini_lio_run` sets it to
+the average rate of the IMU csv (Livox 200 Hz, Hesai JT ~430 Hz; `--imu-rate` overrides). The average, not the median
+interval: Hesai JT timestamps its IMU samples in bursts. With the wrong rate every rotation is scaled (on a JT64 session the
+200 Hz default gave a 15.6 m path and up to 111 deg rotation error vs 7.3 m at the right rate).
 
 Input: `*.laz/*.las` and `*.csv` are sorted and paired by position. **No calibration**: points are used as recorded, and
 a warning is printed only if a LAZ contains more than one lidar id (`user_data`). IMU rows of other `imuId`s are skipped
