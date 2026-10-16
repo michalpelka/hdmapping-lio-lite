@@ -31,6 +31,17 @@ struct ChunkPoint
     int pose; // index of the chunk pose that transforms it
 };
 
+// Per point of the chunk, the map cells it falls in at the current poses (null: none / not used).
+// Kept up to date by lookup_cells() each iteration and used by optimize_chunk(): the map does not
+// change while a chunk is optimized.
+struct PointCells
+{
+    const Bucket* indoor = nullptr;
+    const Bucket* outdoor = nullptr;
+    uint64_t key_in = ~0ull, key_out = ~0ull; // cell keys of the last lookup (~0: none)
+    int nv_in = -1, nv_out = -1; // their normal-histogram bins (-1: none)
+};
+
 // Histogram of map-normal directions (anisotropic weighting: dominant directions are down-weighted).
 struct NvTables
 {
@@ -125,7 +136,7 @@ inline void parallel_chunks(size_t nc, bool mt, F&& f)
 #ifdef _OPENMP
     if (mt)
     {
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 1)
         for (int c = 0; c < static_cast<int>(nc); ++c)
             f(static_cast<size_t>(c));
         return;
@@ -140,23 +151,33 @@ constexpr size_t kChunks = 16; // fixed => the reduction order (and the result) 
 
 } // namespace detail
 
-inline void build_nv_tables(
+// The cells of every point at the current poses (points outside (0.1 m, max_distance) get none),
+// and the normal histograms of those cells (anisotropic weighting, `T` non-null).
+// With `again` (same points, same map, poses moved by an iteration) only points whose cell key
+// changed are looked up again, and the histograms are adjusted for just those points: after the
+// first iteration that is a small fraction, and the hash lookups were the expensive part. The
+// result is the same as a full rebuild.
+inline void lookup_cells(
     const std::vector<ChunkPoint>& pts, const std::vector<Eigen::Affine3d>& traj, const RgdMap& indoor, const RgdMap& outdoor,
-    const Params& P, NvTables& T)
+    const Params& P, std::vector<PointCells>& cells, NvTables* T, bool again = false)
 {
-    for (int b : T.touched_in)
-        T.indoor[b] = 0;
-    for (int b : T.touched_out)
-        T.outdoor[b] = 0;
-    T.touched_in.clear();
-    T.touched_out.clear();
-
     const size_t np = pts.size();
+    if (cells.size() != np)
+        again = false;
+    if (!again)
+        cells.assign(np, PointCells{});
     const size_t nc = std::max<size_t>(1, std::min(detail::kChunks, np));
     const size_t csz = (np + nc - 1) / nc;
     const double max2 = P.max_distance * P.max_distance;
-    std::vector<std::vector<int>> bin_in(nc), bin_out(nc);
-
+    const auto bin_of = [](const Bucket* b)
+    {
+        if (!b)
+            return -1;
+        const double x = b->normal.x(), y = b->normal.y(), z = b->normal.z();
+        return std::fabs(x) < 1.0 && std::fabs(y) < 1.0 && std::fabs(z) < 1.0 ? detail::nv_bin(x, y, z) : -1;
+    };
+    // histogram changes per block: (old bin, new bin), -1 = none
+    std::vector<std::vector<std::pair<int, int>>> ch_in(again ? nc : 0), ch_out(again ? nc : 0);
     detail::parallel_chunks(
         nc, P.multithread,
         [&](size_t c)
@@ -168,39 +189,79 @@ inline void build_nv_tables(
                 if (r2 < 0.01 || r2 > max2)
                     continue;
                 const Eigen::Vector3d pg = traj[pts[i].pose] * pts[i].p;
-                if (const Bucket* b = indoor.find(pg))
+                PointCells& pc = cells[i];
+                const uint64_t ki = indoor.key(pg);
+                if (ki != pc.key_in)
                 {
-                    const double x = b->normal.x(), y = b->normal.y(), z = b->normal.z();
-                    if (std::fabs(x) < 1.0 && std::fabs(y) < 1.0 && std::fabs(z) < 1.0)
-                        bin_in[c].push_back(detail::nv_bin(x, y, z));
+                    pc.key_in = ki;
+                    pc.indoor = indoor.findKey(ki);
+                    const int nb = bin_of(pc.indoor);
+                    if (again && nb != pc.nv_in)
+                        ch_in[c].emplace_back(pc.nv_in, nb);
+                    pc.nv_in = nb;
                 }
                 if (P.hierarchical && r2 >= 25.0)
                 {
-                    if (const Bucket* b = outdoor.find(pg))
+                    const uint64_t ko = outdoor.key(pg);
+                    if (ko != pc.key_out)
                     {
-                        const double x = b->normal.x(), y = b->normal.y(), z = b->normal.z();
-                        if (std::fabs(x) < 1.0 && std::fabs(y) < 1.0 && std::fabs(z) < 1.0)
-                            bin_out[c].push_back(detail::nv_bin(x, y, z));
+                        pc.key_out = ko;
+                        pc.outdoor = outdoor.findKey(ko);
+                        const int nb = bin_of(pc.outdoor);
+                        if (again && nb != pc.nv_out)
+                            ch_out[c].emplace_back(pc.nv_out, nb);
+                        pc.nv_out = nb;
                     }
                 }
             }
         });
-
-    for (size_t c = 0; c < nc; ++c)
+    if (!T)
+        return;
+    const auto inc = [](int bin, std::vector<uint32_t>& table, std::vector<int>& touched)
     {
-        for (int b : bin_in[c])
-            if (T.indoor[b]++ == 0)
-                T.touched_in.push_back(b);
-        for (int b : bin_out[c])
-            if (T.outdoor[b]++ == 0)
-                T.touched_out.push_back(b);
+        if (table[bin]++ == 0)
+            touched.push_back(bin); // a bin may be listed twice: harmless, the list only resets
+    };
+    if (again)
+    {
+        for (size_t c = 0; c < ch_in.size(); ++c)
+        {
+            for (const auto& [o, n] : ch_in[c])
+            {
+                if (o >= 0)
+                    --T->indoor[o];
+                if (n >= 0)
+                    inc(n, T->indoor, T->touched_in);
+            }
+            for (const auto& [o, n] : ch_out[c])
+            {
+                if (o >= 0)
+                    --T->outdoor[o];
+                if (n >= 0)
+                    inc(n, T->outdoor, T->touched_out);
+            }
+        }
+        return;
+    }
+    for (int b : T->touched_in)
+        T->indoor[b] = 0;
+    for (int b : T->touched_out)
+        T->outdoor[b] = 0;
+    T->touched_in.clear();
+    T->touched_out.clear();
+    for (const PointCells& pc : cells)
+    {
+        if (pc.nv_in >= 0)
+            inc(pc.nv_in, T->indoor, T->touched_in);
+        if (pc.nv_out >= 0)
+            inc(pc.nv_out, T->outdoor, T->touched_out);
     }
 }
 
 // One Levenberg-Marquardt step on all poses of the chunk. Returns delta = sum |dx| (1e6 on failure).
 inline double optimize_chunk(
-    const std::vector<ChunkPoint>& pts, std::vector<Eigen::Affine3d>& traj, const std::vector<Eigen::Affine3d>& traj_mm,
-    const RgdMap& indoor, const RgdMap& outdoor, const Params& P, double lm, const NvTables& tables)
+    const std::vector<ChunkPoint>& pts, const std::vector<PointCells>& cells, std::vector<Eigen::Affine3d>& traj,
+    const std::vector<Eigen::Affine3d>& traj_mm, const Params& P, double lm, const NvTables& tables)
 {
     using namespace detail;
     const size_t N = traj.size();
@@ -221,7 +282,6 @@ inline double optimize_chunk(
     const size_t np = pts.size();
     const size_t nc = std::max<size_t>(1, std::min(kChunks, np));
     const size_t csz = (np + nc - 1) / nc;
-    const double max2 = P.max_distance * P.max_distance;
     std::vector<std::vector<Mat6>> cA(nc, std::vector<Mat6>(N, Mat6::Zero()));
     std::vector<std::vector<Vec6>> cG(nc, std::vector<Vec6>(N, Vec6::Zero()));
 
@@ -233,24 +293,18 @@ inline double optimize_chunk(
             for (size_t i = b0; i < b1; ++i)
             {
                 const ChunkPoint& cp = pts[i];
-                const double r2 = cp.p.squaredNorm();
-                if (r2 < 0.01 || r2 > max2)
+                const Bucket* bi = cells[i].indoor;
+                const Bucket* bo = cells[i].outdoor;
+                if (!bi && !bo)
                     continue;
-                const Eigen::Vector3d pg = traj[cp.pose] * cp.p;
                 const Eigen::Vector3d vp = traj[cp.pose].translation();
                 Mat6& A = cA[c][cp.pose];
                 Vec6& g = cG[c][cp.pose];
 
-                const Bucket* bi = indoor.find(pg);
                 if (bi && bi->hits < 20)
                     add_ndt(*bi, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.indoor : nullptr, A, g);
-
-                if (P.hierarchical && r2 >= 25.0)
-                {
-                    const Bucket* bo = outdoor.find(pg);
-                    if (bo && bo->hits < 20)
-                        add_ndt(*bo, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.outdoor : nullptr, A, g);
-                }
+                if (bo && bo->hits < 20)
+                    add_ndt(*bo, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.outdoor : nullptr, A, g);
             }
         });
 

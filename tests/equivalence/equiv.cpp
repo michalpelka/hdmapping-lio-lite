@@ -313,13 +313,15 @@ int main()
     auto up_traj = start, up_mm = start;
     auto my_traj = start, my_mm = start;
     mini_lio::NvTables tables;
+    std::vector<mini_lio::PointCells> cells;
     std::vector<double> t_in(101 * 101 * 101, 0.0), t_out(101 * 101 * 101, 0.0);
 
     double lm = 1.0;
     for (int it = 0; it < 12; ++it)
     {
-        // anisotropic tables from the CURRENT trajectory (mini's builder), shared by both
-        mini_lio::build_nv_tables(my_pts, my_traj, my_in, my_out, P, tables);
+        // anisotropic tables from the CURRENT trajectory (mini's builder, updated incrementally
+        // after the first iteration), shared by both
+        mini_lio::lookup_cells(my_pts, my_traj, my_in, my_out, P, cells, &tables, it > 0);
         std::fill(t_in.begin(), t_in.end(), 0.0);
         std::fill(t_out.begin(), t_out.end(), 0.0);
         for (size_t i = 0; i < tables.indoor.size(); ++i)
@@ -338,7 +340,7 @@ int main()
             P.fix_origin_sigma, P.fix_origin_sigma, P.fix_origin_sigma, P.fix_origin_sigma, false, false, true, true, true, ls, thr_flag, conv_res,
             conv_thr, t_in, t_out);
 
-        const double my_delta = mini_lio::optimize_chunk(my_pts, my_traj, my_mm, my_in, my_out, P, lm, tables);
+        const double my_delta = mini_lio::optimize_chunk(my_pts, cells, my_traj, my_mm, P, lm, tables);
 
         double dpos = 0, drot = 0;
         for (int i = 0; i < Np; ++i)
@@ -368,7 +370,7 @@ int main()
     std::printf("  position error vs ground truth: start %.4f m -> upstream %.4f m, mini %.4f m\n", e_start, e_up, e_my);
 
     // ======== Test C: anisotropic-weighting histograms ========
-    std::printf("C. normal-vector histograms (upstream lambda vs mini_lio::build_nv_tables)\n");
+    std::printf("C. normal-vector histograms (upstream lambda vs mini_lio::lookup_cells)\n");
     {
         FakeParams fp;
         fp.in_out_params_indoor = gin;
@@ -380,7 +382,8 @@ int main()
         std::vector<double> h_in, h_out;
         upstream_hist(fp, fwd, up_pts, h_in, h_out);
         mini_lio::NvTables nt;
-        mini_lio::build_nv_tables(my_pts, start, my_in, my_out, P, nt);
+        std::vector<mini_lio::PointCells> nt_cells;
+        mini_lio::lookup_cells(my_pts, start, my_in, my_out, P, nt_cells, &nt);
         double d_in = 0, d_out = 0, total_in = 0, total_out = 0;
         for (size_t i = 0; i < h_in.size(); ++i)
         {

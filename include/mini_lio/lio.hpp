@@ -215,11 +215,13 @@ private:
         std::vector<OutputPoint> out_pts;
         pts.reserve(n_raw);
         size_t k = 0;
+        size_t first_ge = 0; // first pose with pose_t >= t: the times only grow, so walk instead of searching
         for (auto it = lo; it != hi; ++it, ++k)
         {
             const double t = ts_step > 0.0 ? t0 + static_cast<double>(k) * ts_step : it->t;
-            const auto lb = std::lower_bound(pose_t.begin(), pose_t.end(), t);
-            const long idx = static_cast<long>(lb - pose_t.begin()) - 1;
+            while (first_ge < thr && pose_t[first_ge] < t)
+                ++first_ge;
+            const long idx = static_cast<long>(first_ge) - 1;
             if (idx >= 0 && idx < static_cast<long>(thr) && std::fabs(t - pose_t[idx]) <= 0.01)
             {
                 pts.push_back({ it->p, static_cast<int>(idx) });
@@ -232,7 +234,8 @@ private:
         if (P_.decimation > 0.0 && pts.size() > 1000)
         {
             const Eigen::Vector3d b(P_.decimation, P_.decimation, P_.decimation);
-            ankerl::unordered_dense::set<uint64_t> seen;
+            ankerl::unordered_dense::set<uint64_t>& seen = seen_; // kept: no allocation per chunk
+            seen.clear();
             seen.reserve(pts.size());
             std::vector<ChunkPoint> dec;
             dec.reserve(pts.size());
@@ -280,9 +283,8 @@ private:
             for (int it = 0; it < P_.nr_iter; ++it)
             {
                 it_end = it + 1;
-                if (P_.use_anisotropic_weighting)
-                    build_nv_tables(pts, traj, indoor_, outdoor_, P_, nv_);
-                delta = optimize_chunk(pts, traj, traj_mm, indoor_, outdoor_, P_, lm, nv_);
+                lookup_cells(pts, traj, indoor_, outdoor_, P_, cells_, P_.use_anisotropic_weighting ? &nv_ : nullptr, it > 0);
+                delta = optimize_chunk(pts, cells_, traj, traj_mm, P_, lm, nv_);
                 if (delta < P_.convergence_delta)
                     break;
                 if (it % 10 == 0 && it > 0)
@@ -337,6 +339,8 @@ private:
     Ahrs ahrs_;
     RgdMap indoor_, outdoor_;
     NvTables nv_;
+    std::vector<PointCells> cells_;
+    ankerl::unordered_dense::set<uint64_t> seen_;
     Callback cb_;
 
     std::deque<ImuPose> imu_;

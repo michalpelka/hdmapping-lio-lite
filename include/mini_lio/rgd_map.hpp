@@ -42,9 +42,11 @@ public:
     size_t size() const { return map_.size(); }
     double resolution() const { return b_.x(); }
 
-    const Bucket* find(const Eigen::Vector3d& p) const
+    const Bucket* find(const Eigen::Vector3d& p) const { return findKey(key(p)); }
+    uint64_t key(const Eigen::Vector3d& p) const { return rgd_key(p, b_); }
+    const Bucket* findKey(uint64_t k) const
     {
-        const auto it = map_.find(rgd_key(p, b_));
+        const auto it = map_.find(k);
         return it == map_.end() ? nullptr : &it->second;
     }
 
