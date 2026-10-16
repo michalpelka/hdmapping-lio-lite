@@ -28,6 +28,7 @@ static void usage()
         "  --chunks-per-scan N   chunks (0.1 s each) per scan_lio_N.laz (default 51 as upstream)\n"
         "  --min-out-range R drop output points closer than R m to the sensor (default 0.5)\n"
         "  --no-laz          write trajectories only\n"
+        "  --threads N       OpenMP threads (default: all cores; 2 is fastest on a Raspberry Pi 5)\n"
         "  --single-thread");
 }
 
@@ -65,6 +66,8 @@ int main(int argc, char** argv)
             min_out = std::atof(val());
         else if (arg("--no-laz"))
             write_laz = false;
+        else if (arg("--threads"))
+            P.threads = std::atoi(val());
         else if (arg("--single-thread"))
             P.multithread = false;
         else if (arg("--help") || arg("-h"))

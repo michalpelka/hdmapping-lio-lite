@@ -70,9 +70,16 @@ inline double cauchy1(double d)
     return 1.0 / (M_PI * (1.0 + d * d));
 }
 
+// One point-to-distribution term: A += J^T P J, g += J^T P r for the source point `src` (local
+// frame) against the cell's mean and inverse covariance P. The same as the generated
+// point_to_point_source_to_target_tait_bryan_wc_AtPA/AtPB_simplified_precomputed_trig, using
+// their structure: J = [I3 | a b c] (a, b, c = derivatives of R(om, fi, ka) * src), so the blocks
+// are P, P [a b c] and [a b c]^T P [a b c] - about half the flops, 2x faster per term on a
+// Raspberry Pi 5 - and the anisotropic weight scales P once instead of dividing the 42 outputs. `nv_bin` is the cell's histogram bin
+// (PointCells::nv_in / nv_out, -1: none); `table` null: no anisotropic weighting.
 inline void add_ndt(
     const Bucket& b, const Eigen::Vector3d& src, const TbTrig& t, const Eigen::Vector3d& viewport, bool use_vp,
-    const std::vector<uint32_t>* table, Mat6& A, Vec6& g)
+    const std::vector<uint32_t>* table, int nv_bin, Mat6& A, Vec6& g)
 {
     const Eigen::Matrix3d& infm = b.cov_inverse;
     if ((infm.array() > 100000.0).any() || (infm.array() < -100000.0).any())
@@ -80,31 +87,52 @@ inline void add_ndt(
     if (use_vp && b.normal.dot(viewport - b.mean) < 0)
         return;
 
-    Mat6 AtPA;
-    point_to_point_source_to_target_tait_bryan_wc_AtPA_simplified_precomputed_trig(
-        AtPA, t.pose.px, t.pose.py, t.pose.pz, t.sin_om, t.cos_om, t.sin_fi, t.cos_fi, t.sin_ka, t.cos_ka, src.x(), src.y(), src.z(),
-        infm(0, 0), infm(0, 1), infm(0, 2), infm(1, 0), infm(1, 1), infm(1, 2), infm(2, 0), infm(2, 1), infm(2, 2));
-    Vec6 AtPB;
-    point_to_point_source_to_target_tait_bryan_wc_AtPB_simplified_precomputed_trig(
-        AtPB, t.pose.px, t.pose.py, t.pose.pz, t.sin_om, t.cos_om, t.sin_fi, t.cos_fi, t.sin_ka, t.cos_ka, src.x(), src.y(), src.z(),
-        infm(0, 0), infm(0, 1), infm(0, 2), infm(1, 0), infm(1, 1), infm(1, 2), infm(2, 0), infm(2, 1), infm(2, 2), b.mean.x(),
-        b.mean.y(), b.mean.z());
-
-    if (table)
+    Eigen::Matrix3d P = infm;
+    if (table && nv_bin >= 0)
     {
-        const double x = b.normal.x(), y = b.normal.y(), z = b.normal.z();
-        if (std::fabs(x) < 1.0 && std::fabs(y) < 1.0 && std::fabs(z) < 1.0)
-        {
-            const double w1 = static_cast<double>((*table)[nv_bin(x, y, z)]);
-            if (w1 > 0.0)
-            {
-                AtPA /= w1;
-                AtPB /= w1;
-            }
-        }
+        const double w1 = static_cast<double>((*table)[nv_bin]);
+        if (w1 > 0.0)
+            P *= 1.0 / w1;
     }
-    A += AtPA;
-    g += AtPB;
+
+    // the generated code's subexpressions (same names), see the header above
+    const double x_s = src.x(), y_s = src.y(), z_s = src.z();
+    const double x0 = t.cos_ka * t.sin_om, x1 = t.cos_om * t.sin_ka;
+    const double x2 = t.sin_fi * x1 + x0;
+    const double x3 = t.sin_ka * t.sin_om, x4 = t.cos_ka * t.cos_om;
+    const double x5 = t.sin_fi * x4 - x3;
+    const double x6 = t.cos_fi * z_s;
+    const double x7 = t.cos_om * x6 + x2 * y_s - x5 * x_s; // (R src).z
+    const double x8 = t.sin_fi * x0 + x1;
+    const double x9 = -t.sin_fi * x3 + x4;
+    const double x10 = -t.sin_om * x6 + x8 * x_s + x9 * y_s; // (R src).y
+    const double x11 = t.sin_ka * y_s, x12 = t.cos_ka * x_s;
+    const double x13 = t.sin_fi * x11 - t.sin_fi * x12 + x6;
+    const double x15 = -t.cos_fi * x11 + t.cos_fi * x12 + t.sin_fi * z_s; // (R src).x
+    const double x16 = t.sin_om * x15, x17 = t.cos_om * x15;
+    const double x18 = -x8 * y_s + x9 * x_s;
+    const double x19 = x2 * x_s + x5 * y_s;
+    const double x20 = t.cos_fi * (t.cos_ka * y_s + t.sin_ka * x_s);
+
+    Eigen::Matrix3d Jr; // columns a, b, c: d(R src)/d(om, fi, ka)
+    Jr << 0.0, x13, -x20,
+          -x7, x16, x18,
+          x10, -x17, x19;
+    const Eigen::Vector3d r(t.pose.px + x15 - b.mean.x(), t.pose.py + x10 - b.mean.y(), t.pose.pz + x7 - b.mean.z());
+
+    const Eigen::Matrix3d PJ = P * Jr;
+    const Eigen::Vector3d Pr = P * r;
+    // built locally, then one contiguous add (block-wise adds into the strided 6x6 were slower)
+    Mat6 H;
+    H.topLeftCorner<3, 3>() = P;
+    H.topRightCorner<3, 3>() = PJ;
+    H.bottomLeftCorner<3, 3>() = PJ.transpose();   // = Jr^T P (P symmetric up to rounding)
+    H.bottomRightCorner<3, 3>().noalias() = Jr.transpose() * PJ;
+    Vec6 G;
+    G.head<3>() = Pr;
+    G.tail<3>().noalias() = Jr.transpose() * Pr;
+    A += H;
+    g += G;
 }
 
 // relative pose (translation + Tait-Bryan) of b seen from a
@@ -130,19 +158,21 @@ inline void bump(TaitBryanPose& p, int k, double h)
     }
 }
 
+// `threads` > 0: that many OpenMP threads, else OpenMP's default (all cores)
 template <class F>
-inline void parallel_chunks(size_t nc, bool mt, F&& f)
+inline void parallel_chunks(size_t nc, bool mt, int threads, F&& f)
 {
 #ifdef _OPENMP
     if (mt)
     {
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads > 0 ? threads : omp_get_max_threads())
         for (int c = 0; c < static_cast<int>(nc); ++c)
             f(static_cast<size_t>(c));
         return;
     }
 #endif
     (void)mt;
+    (void)threads;
     for (size_t c = 0; c < nc; ++c)
         f(c);
 }
@@ -179,7 +209,7 @@ inline void lookup_cells(
     // histogram changes per block: (old bin, new bin), -1 = none
     std::vector<std::vector<std::pair<int, int>>> ch_in(again ? nc : 0), ch_out(again ? nc : 0);
     detail::parallel_chunks(
-        nc, P.multithread,
+        nc, P.multithread, P.threads,
         [&](size_t c)
         {
             const size_t b0 = c * csz, b1 = std::min(b0 + csz, np);
@@ -286,7 +316,7 @@ inline double optimize_chunk(
     std::vector<std::vector<Vec6>> cG(nc, std::vector<Vec6>(N, Vec6::Zero()));
 
     parallel_chunks(
-        nc, P.multithread,
+        nc, P.multithread, P.threads,
         [&](size_t c)
         {
             const size_t b0 = c * csz, b1 = std::min(b0 + csz, np);
@@ -302,9 +332,11 @@ inline double optimize_chunk(
                 Vec6& g = cG[c][cp.pose];
 
                 if (bi && bi->hits < 20)
-                    add_ndt(*bi, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.indoor : nullptr, A, g);
+                    add_ndt(*bi, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.indoor : nullptr,
+                            cells[i].nv_in, A, g);
                 if (bo && bo->hits < 20)
-                    add_ndt(*bo, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.outdoor : nullptr, A, g);
+                    add_ndt(*bo, cp.p, tb[cp.pose], vp, P.use_view_point_and_normal, P.use_anisotropic_weighting ? &tables.outdoor : nullptr,
+                            cells[i].nv_out, A, g);
             }
         });
 

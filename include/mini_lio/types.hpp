@@ -155,6 +155,10 @@ struct Params
     bool use_anisotropic_weighting = true;
     bool use_motion_from_previous_step = true; // constant velocity prediction
     bool multithread = true;
+    // OpenMP threads for the per-point work (0: OpenMP's default, all cores). The parallel regions
+    // are short and memory-bound: on a Raspberry Pi 5, 2 threads are fastest (~7.6 ms per JT128
+    // chunk vs ~9 with 4), and they leave cores for the lidar driver.
+    int threads = 0;
 
     // motion model (relative pose between consecutive IMU poses) and fixed first pose
     double mm_sigma_xyz = 0.0005; // [m]

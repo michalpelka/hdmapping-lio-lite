@@ -130,7 +130,7 @@ private:
 #ifdef _OPENMP
         if (P_.multithread && P_.hierarchical)
         {
-#pragma omp parallel sections
+#pragma omp parallel sections num_threads(2)
             {
 #pragma omp section
                 indoor_.update(pts, viewport, ray_cast);
